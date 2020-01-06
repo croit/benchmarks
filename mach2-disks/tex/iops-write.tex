@@ -1,0 +1,38 @@
+\documentclass[class=minimal,border=0pt]{standalone}
+
+\usepackage{croitcolor}
+\usepackage{pgfplots}
+\usepackage{pgfplotstable}
+\pgfplotsset{compat=1.13}
+\pgfplotsset{grid style={dotted}}
+\usetikzlibrary{plotmarks}
+
+\usepackage{sansmath} 
+\sansmath
+\renewcommand{\familydefault}{\sfdefault}
+
+\begin{document}
+\begin{tikzpicture}
+\begin{axis}[
+	ybar,
+	xmode=log,
+	log basis x=2,
+	log ticks with fixed point,
+	grid=major,
+	width=15cm,
+	height=7.5cm,
+	xmin=0.75,
+	xmax=384,
+	ymin=0,
+	ylabel={IOPS},
+	xlabel={Queue Depth},
+	legend cell align={left},
+	legend entries = {Write IOPS{,} Seagate MACH.2, Write IOPS{,} normal HDD},
+	legend pos = north west,
+]
+\addplot[mark=none,color=CroitBlue,fill] table[col sep=comma]{../results/iops-write-mach2.csv};
+\addplot[mark=none,color=CroitRed,fill] table[col sep=comma]{../results/iops-write-normal.csv};
+\end{axis}
+\end{tikzpicture}
+
+\end{document}
