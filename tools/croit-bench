@@ -1,0 +1,414 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+use JSON;
+use Scalar::Util qw(reftype);
+use Data::Dumper qw(Dumper);
+use Storable 'dclone';
+use Pod::Usage qw(pod2usage);
+use Getopt::Long;
+use IO::Dir;
+
+# Testestup result parameter
+my $setup = "ZFS_ZVOL"; # base name of json output in $benchmark_dir
+my $benchmark_dir = "./run1";
+my $num_offset = 0;
+
+my $rbd_clustername = 'ceph'; # Specifies the name of the ceph cluster.
+my $rbd_rbdname = 'fio_rbd'; # Specifies the name of the RBD.
+my $rbd_pool = 'rbd'; # Specifies the name of the Ceph pool containing the RBD.
+my $rbd_clientname = 'admin'; # Specifies the username (without the 'client.' prefix).
+
+# basic run parametes
+my $run_time = 60;		# the test runtime in seconds.
+my $ioengine = 'libaio';	# see alternative ioengines in man fio.
+my $path = "/dev/zvol/zfs/onetest";	# this could be the path of a file or a device.
+my $size = "9G"; 		# size of the test file.
+
+
+my $fio_base_cmd = ['fio', "--filename=$path", "--size=$size",
+		'--time_based', '--group_reporting', "--ioengine=$ioengine",
+		    '--output-format=json', "--runtime=$run_time"];
+
+# common parameters
+my $parameters = { 'bs' => ['4K', '16K', '64K', '4M'],
+			 'direct' => [0],
+			 'sync' => [1,0],
+			 'numjobs' => [1,2,4],
+			 'iodepth' => [1,4,8,16,32],
+			 'rw' => ['write', 'read'],
+		       };
+
+my $parameter_order = [ 'direct', 'bs', 'sync', 'numjobs', 'iodepth', 'rw' ];
+
+my $fio_modes = {
+    'read' => 'read',
+    'randread' => 'read',
+    'write' => 'write',
+    'randwrite' => 'write',
+    'trim' => 'trim',
+    'randtrim' => 'trim',
+};
+
+#fio's json output in stretch has only io_bytes as property, which contains
+#a number corresponding to buster's io_kbytes - see fio git commit:
+# c12d597ac36632a6f08c749df302135bbd339cb2
+
+my $alternate_keys = {
+    lat => { name => 'lat_ns', scale => 1/1000},
+    io_kbytes => { name => 'io_bytes', scale => 1},
+};
+
+my $num = 0 + $num_offset;
+
+# call croit-bench w/o arguement and get list of help
+# or if arguemnt is not a sub show help as well
+help() if !@ARGV;
+GetOptions(
+    'h|help!'	 => \&help,
+    'r|run!'	 => \&run,
+    'p|parse!'	 => \&parse,
+    'g|graph!'	 => \&graph,
+) or help();
+
+############################################################
+=pod
+
+=head1 SYNOPSIS
+
+croit-bench [B<-hrpg>] [B<-help>] [B<-run>] [B<-parse>] [B<-graph>]
+
+=head1 OPTIONS AND ARGUMENTS
+
+=over 12
+
+=item B<-r -run>
+
+Execute fio and put its results in $benchmark_dir.
+
+=cut
+############################################################
+sub run {
+    mkdir $benchmark_dir if !-d $benchmark_dir;
+    die "Couldn't find $path\n" if (!-e $path);
+    foreach_para($fio_base_cmd, $parameters, $parameter_order);
+}
+
+############################################################
+=pod
+
+=item B<-p -parse>
+
+Parse the results files of fio in $benchmark_dir and generate the results.csv.
+
+=cut
+############################################################
+sub parse {
+    my $files = get_files();
+    create_benchmark_cvs($files);
+}
+
+############################################################
+=pod
+
+=item B<-g -graph>
+
+Graph the results of fio in benchmark_dir and generate a html file.
+
+=cut
+############################################################
+sub graph {
+    my $files = get_files();
+    create_graph_html($files);
+}
+
+############################################################
+=pod
+
+=item B<-h -help>
+
+Print this message.
+
+=cut
+############################################################
+sub help {
+    pod2usage(-exit => 1, -verbose => 1);
+};
+
+
+sub foreach_para {
+    my ($fio_cmd, $parameters, $param_order) = @_;
+
+    my $key;
+    my $order_copy = [ @$param_order ];
+    if (@$order_copy) {
+	$key = shift @$order_copy;
+	my $values = $parameters->{$key};
+	foreach my $value (@$values) {
+	    my $cmd = [ @$fio_cmd ];
+	    push @$cmd, "--${key}=${value}";
+	    foreach_para($cmd, $parameters, $order_copy);
+	}
+    } else {
+	run_fio($fio_cmd);
+    }
+}
+
+sub run_fio {
+    my ($fio_cmd, $run) = @_;
+
+    my $jobname =  join('', @$fio_cmd);
+    my $log_name = $jobname =~ s/--/-/gr;
+
+    my $string = $log_name;
+    $log_name = $string =~ s/-(\w+|[^=]|_)*-/-/gr;
+
+    $string = $log_name;
+    $log_name = $string =~ s/-\w+=/-/gr;
+
+    $string = $log_name;
+    $log_name = $string =~ s|/(\w+/)+||gr;
+
+    my $output = "${benchmark_dir}/${setup}_${num}.json";
+    $num++;
+    my @cmd = @$fio_cmd;
+
+    push @cmd , "--output=$output";
+    push @cmd , "--name=$jobname";
+
+    print "start run: ".join(' ', @cmd)."\n";
+    system(@cmd) == 0 or die "run failed, $?";
+    system("rm -f $path") if $path !~ m|^/dev/|;
+}
+
+sub get_files {
+
+    my $dh = IO::Dir->new ($benchmark_dir) ||
+	die "Couldn't open dir '$benchmark_dir': $!";
+
+    my $bench_files = [];
+    while (defined(my $tmp = $dh->read)) {
+	if ($tmp =~ m/\.json$/) {
+	    push @$bench_files, $tmp;
+	}
+    }
+    $dh->close;
+
+    my ($anum, $bnum, $sorted_files);
+    @$sorted_files =  sort {
+	$a =~ m/^\Q${setup}_\E(\d+)/;
+	$anum = $1 // 0;
+	$b =~ m/^\Q${setup}_\E(\d+)/;
+	$bnum = $1 // 0;
+	$anum <=> $bnum
+    }  @$bench_files;
+
+    return $sorted_files;
+
+}
+
+sub create_benchmark_cvs {
+    my ($files) = @_;
+
+    my @fio_results;
+    foreach my $file (@$files) {
+	my $filename = "$benchmark_dir/$file";
+	open(my $fh, '<:encoding(UTF-8)', "$filename") ||
+	    die "Could not open file '$filename' $!";
+
+	my $json_string = '';
+	while (my $row = <$fh>) {
+	    chomp $row;
+	    $json_string .= $row;
+	}
+	my $fio_res = JSON::decode_json $json_string;
+	push @fio_results, $fio_res;
+	close($fh);
+    }
+    my $cvs_string = '';
+    foreach my $row (@$parameter_order) {
+	if ($row eq 'numjobs') {
+	    $cvs_string .= create_row_for_num_jobs(\@fio_results);
+	} else {
+	    $cvs_string .= create_row_from_results(\@fio_results, ['global options', $row]);
+	}
+    }
+    $cvs_string .= create_row_from_results(\@fio_results, ['runtime'], 1);
+    $cvs_string .= create_row_from_results(\@fio_results, ['io_kbytes'], 1);
+    $cvs_string .= create_row_from_results(\@fio_results, ['bw'], 1);
+    $cvs_string .= create_row_from_results(\@fio_results, ['iops'], 1);
+    $cvs_string .= create_row_from_results(\@fio_results, ['lat', 'min'], 1, 1);
+    $cvs_string .= create_row_from_results(\@fio_results, ['lat', 'max'], 1, 1);
+    $cvs_string .= create_row_from_results(\@fio_results, ['lat', 'mean'], 1, 1);
+    $cvs_string .= create_row_from_results(\@fio_results, ['lat', 'stddev'], 1, 1);
+    $cvs_string .= create_row_from_results(\@fio_results, ['jobs', 'usr_cpu']);
+    $cvs_string .= create_row_from_results(\@fio_results, ['jobs', 'sys_cpu']);
+
+    my $out = "$benchmark_dir/results.csv";
+    open(my $fh, '>:encoding(UTF-8)', $out) ||
+	die "Could not open file '$out' $!";
+    print $fh $cvs_string;
+    close($fh);
+}
+
+sub create_row_for_num_jobs {
+    my ($fio_results) = @_;
+
+    my $row = '';
+    my $jobname;
+    my $num = scalar(@$fio_results);
+
+    for (my $counter=0; $counter<$num; $counter++) {
+	my $fio_job = @$fio_results[$counter];
+	$jobname = $fio_job->{'jobs'}[0]->{'job options'}->{'name'};
+	$jobname =~ m/numjobs=(\d+)/;
+	$row .= "$1\t";
+    }
+    return "num jobs\t$row\n";
+}
+
+sub create_row_from_results {
+    my ($fio_results, $path, $mode, $opt_label) = @_;
+
+    my $row = '';
+
+    foreach my $job (@$fio_results) {
+	my $hash;
+	if (defined($mode)) {
+	    $mode = $job->{'global options'}->{'rw'};
+	    $mode = $fio_modes->{$mode};
+	    $hash = @{$job->{'jobs'}}[0]->{$mode};
+	} else {
+	    $hash = $job;
+	}
+
+	$row .= extract_key_from_json($hash, $path)."\t";
+    }
+
+    my $label = $opt_label ? join( ' ', @$path) : pop(@$path);
+
+    return "$label\t$row\n";
+}
+
+sub extract_key_from_json {
+    my ($data, $path) = @_;
+
+    my $res = { %$data };
+    my $tmp = { };
+    my $scale;
+
+    foreach my $comp (@$path) {
+	if( reftype($res) eq 'ARRAY'){
+	    $res = @$res[0];
+	}
+	$tmp = $res->{$comp};
+
+	if( defined(my $altkey = $alternate_keys->{$comp})) {
+	    $tmp //= $res->{$altkey->{name}};
+	    $scale = $altkey->{scale};
+	}
+
+	die "cannot find data for key $comp\n" if !defined($tmp);
+	$res = $tmp;
+    }
+
+    $res *= $scale if defined($scale);
+    return $res;
+}
+
+sub create_graph_data {
+    my ($files) = @_;
+
+    my $fio_data = [];
+    foreach my $file (@$files) {
+	$file = "$benchmark_dir/$file";
+	open(my $fh, '<', $file) or die "Could not open file '$file' $!";
+	read $fh, my $file_content, -s $fh;
+	close $fh;
+
+	my $fio_res = JSON::decode_json($file_content);
+	#"global options" : {
+	#  "filename" : "fiotest",
+	#  "size" : "9G",
+	#  "ioengine" : "libaio",
+	#  "runtime" : "60",
+	#  "direct" : "1",
+	#  "bs" : "4K",
+	#  "sync" : "1",
+	#  "numjobs" : "1",
+	#  "iodepth" : "1",
+	#  "rw" : "write"
+	#},
+	my $global_opts = $fio_res->{'global options'};
+	my $rw = $global_opts->{rw};
+	my $bs = $global_opts->{bs};
+	my $numjobs = $global_opts->{numjobs};
+	my $iodepth = $global_opts->{iodepth};
+	my $sync = $global_opts->{sync};
+
+	my $bw = $fio_res->{jobs}[0]->{$rw}->{bw_bytes};
+	my $iops = $fio_res->{jobs}[0]->{$rw}->{iops};
+
+	my $trace = {};
+	if ( $bs eq '4K') {
+	    $trace = {
+		x => [ $numjobs ],
+		y => [ $iops ],
+		name => "$rw-$iodepth",
+		type => 'bar',
+	    };
+	}
+	push @$fio_data, $trace;
+    }
+
+    return $fio_data;
+}
+
+sub create_graph_html {
+    my ($files) = @_;
+
+    my $fio_data = create_graph_data($files);
+    my $traces = JSON::encode_json({
+	    data => [ @$fio_data ],
+	    layout => {
+		title => 'IO/s',
+		barmode => 'group',
+		hovermode => 'closest',
+	    },
+	    config => {
+		responsive => 'true',
+		displayModeBar => 'true',
+	    },
+	});
+
+    my $htmlfile = 'run1.html';
+    open(my $fh, '>', $htmlfile) or die "Could not open file '$htmlfile' $!";
+    foreach my $line (<DATA>) {
+	$line =~ s/#fio_data_bw#/$traces/;
+	print $fh "$line";
+    }
+    close $fh;
+}
+
+__DATA__
+<!DOCTYPE html>
+<html>
+  <head>
+    <!-- Plotly.js -->
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  </head>
+  <body>
+    <!-- Plots go in blank <div> elements.
+        You can size them in the plot layout,
+        or give the div a size as shown here.
+    -->
+    <div id="benchmark" style="width:90%;"></div>
+
+    <script type="text/javascript">
+      var data = #fio_data_bw#;
+      Plotly.newPlot('benchmark', data);
+    </script>
+  </body>
+</html>

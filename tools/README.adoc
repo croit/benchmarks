@@ -1,0 +1,22 @@
+CROIT-BENCH
+=========
+This repository has a bunch of scripts for testing Proxmox VE and its storage.
+
+building croit-bench package
+--------------------------
+
+Dependency for building a self-contained executable.
+
+ apt install libpar-packer-perl make
+
+You can then run `make` to create the package.
+
+croit-bench
+---------
+The script runs fio in various combinations (fio options in the script file).
+The output is saved under 'run1' in the same directory as the script. Each test
+result is saved a json output and combined into a 'results.csv' on the end.
+
+croit-benchdiff
+-------------
+Compare two results.csv and create new results.csv with the differences only.
